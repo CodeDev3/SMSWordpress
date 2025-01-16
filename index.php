@@ -1066,8 +1066,760 @@ class CRC_REST_API extends WP_REST_Controller
 
         return rest_ensure_response($questions);
     }
+
+
+    
 }
 
 
 $serverApi = new CRC_REST_API();
+add_filter('jwt_auth_token_before_dispatch', array($serverApi, 'jwt_auth'), 10, 2);
+
+
+
+
+
+
+
+<?php
+/**
+ * Plugin Name: Custom WP REST API 
+ * Author : Divyank
+ */
+
+use Firebase\JWT\JWT;
+use \Firebase\JWT\Key;
+
+require_once(ABSPATH . 'wp-admin/includes/file.php');
+require_once(ABSPATH . 'wp-admin/includes/media.php');
+require_once(ABSPATH . 'wp-admin/includes/image.php');
+
+define('SITE_URL', site_url());
+
+class CRC_REST_API extends WP_REST_Controller
+{
+    private $api_namespace;
+    private $api_version;
+    public  $user_token;
+    public  $user_id;
+
+    public function __construct()
+    {
+        $this->api_namespace = 'api/v';
+        $this->api_version = '1';
+        $this->required_capability = 'read';
+        $this->init();
+
+        /*------- Start: Validate Token Section -------*/
+        $headers = getallheaders();
+        if (isset($headers['Authorization'])) {
+            if (preg_match('/Bearer\s(\S+)/', $headers['Authorization'], $matches)) {
+                $this->user_token =  $matches[1];
+            }
+        }
+        /*------- End: Validate Token Section -------*/
+    }
+
+    private function successResponse($message = '', $data = array())
+    {
+        $response = array();
+        $response['status'] = "success";
+        $response['message'] = $message;
+        $response['data'] = $data;
+
+        return new WP_REST_Response($response, 200);
+    }
+
+    private function errorResponse($message = '', $type = 'ERROR', $statusCode = 400)
+    {
+        $response = array();
+        $response['status'] = "error";
+        $response['error_type'] = $type;
+        $response['message'] = $message;
+
+        return new WP_REST_Response($response, $statusCode);
+    }
+
+    public function register_routes()
+    {
+        $namespace = $this->api_namespace . $this->api_version;
+        $publicItems = array(
+            'signup',
+            'getProfile',
+            'updateProfile',
+            'validateToken',
+            'getAllTeachers',
+            'allTeachers',
+            'subjectTeachers',
+            'alotTimePeriod',
+            'periodDetails',
+            'checkAlottedPeriod',
+            'checkAlottedClasses',
+            'updateLoginStatus',
+            'loginS',
+            'getTeachersAttedance'
+        );
+        foreach ($publicItems as $Item) {
+            register_rest_route(
+                $namespace,
+                '/' . $Item,
+                array(
+                    array(
+                        'methods' => 'POST',
+                        'callback' => array($this, $Item),
+                        'permission_callback' => '__return_true'
+                    ),
+                )
+            );
+        }
+    }
+
+    public function init()
+    {
+        add_action('rest_api_init', array($this, 'register_routes'));
+        add_action('rest_api_init', function () {
+            remove_filter('rest_pre_serve_request', 'rest_send_cors_headers');
+            add_filter('rest_pre_serve_request', function ($value) {
+                header('Access-Control-Allow-Origin:*');
+                header('Access-Control-Allow-Methods: POST, GET, OPTIONS, PUT, DELETE');
+                header('Access-Control-Allow-Headers: Authorization, Content-Type');
+                header('Access-Control-Allow-Credentials: true');
+                return $value;
+            });
+        }, 15);
+    }
+
+    public function isUserExists($user)
+    {
+        global $wpdb;
+        $count = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $wpdb->users WHERE ID = %d", $user));
+        if ($count == 1) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    public function getUserIdByToken($token)
+    {
+        $decoded_array = array();
+        $user_id = 0;
+        if ($token) {
+            try {
+                $decoded = JWT::decode($token, new Key(JWT_AUTH_SECRET_KEY, apply_filters('jwt_auth_algorithm', 'HS256')));
+                $decoded_array = (array) $decoded;
+            } catch (\Firebase\JWT\ExpiredException $e) {
+                return false;
+            }
+        }
+        if (count($decoded_array) > 0) {
+            $user_id = $decoded_array['data']->user->id;
+        }
+        if ($this->isUserExists($user_id)) {
+            return $user_id;
+        } else {
+            return false;
+        }
+    }
+
+    private function isValidToken()
+    {
+        $this->user_id  = $this->getUserIdByToken($this->user_token);
+    }
+
+    function jwt_auth($data, $user)
+    {
+        unset($data['user_nicename']);
+        unset($data['user_display_name']);
+        $result = $this->getProfile($user->ID);
+        $result['token'] =  $data['token'];
+        return $this->successResponse('User Logged in successfully', $result);
+    }
+
+    public function validateToken()
+    {
+        $this->isValidToken();
+        $userId = $this->user_id ? $this->user_id : false;
+        if (!$userId) {
+            return $this->errorResponse('Token Expired','Error',200);
+        } else {
+            return $this->successResponse('Token Verified', ['user_id' => $userId]);
+        }
+    }
+
+    public function signup($data)
+    {
+        $user_data = $data->get_json_params();
+        $user_email    = sanitize_email($user_data['userEmail']);
+        $user_name     = sanitize_text_field($user_data['userName']);
+        $user_password = sanitize_text_field($user_data['userPassword']);
+        $user_full_name = sanitize_text_field($user_data['userFullName']);
+        $user_dob      = sanitize_text_field($user_data['userDOB']);
+        $user_mob      = sanitize_text_field($user_data['userMob']);
+        $class      = sanitize_text_field($user_data['class']);
+        $subject      = sanitize_text_field($user_data['subject']);
+        $userName = (explode(' ', $user_full_name));
+
+        if (email_exists($user_email)) {
+            return $this->errorResponse('Email already Registerd');
+        }
+
+        if (username_exists($user_name)) {
+            return $this->errorResponse('Username already taken');
+        }
+
+        $role = 'Teacher';
+        $firstName = $userName[0];
+        $lastName = $userName[1];
+
+        $userData = array(
+            'user_pass' => $user_password,
+            'user_login' => $user_name,
+            'display_name' => $firstName,
+            'first_name' => $firstName,
+            'last_name' => $lastName,
+            'user_email' => $user_email,
+            'role' => $role
+        );
+
+        $user_id = wp_insert_user($userData);
+        $user = new WP_User($user_id);
+        if (!get_role('Teacher')) {
+            add_role('Teacher', 'Teacher', ['read' => true]);
+        }
+        $user->set_role('Teacher');
+
+        if (is_wp_error($user_id)) {
+            return new WP_Error('user_creation_failed', 'Failed to create user.', ['status' => 400]);
+        }
+        update_user_meta($user_id, 'full_name', $user_full_name);
+        update_user_meta($user_id, 'dob', $user_dob);
+        update_user_meta($user_id, 'mobile_number', $user_mob);
+        update_user_meta($user_id, 'class', $class);
+        update_user_meta($user_id, 'subject', $subject);
+
+        return new WP_REST_Response('User created successfully', 200);
+    }
+
+
+    // get user profile
+    public function getProfile($user_id)
+    {
+        $user = get_user_by('id', $user_id);
+
+        if (!$user) {
+            return $this->errorResponse('Error user profile not found', 404);
+        }
+        $profileImageUrl =esc_url(wp_get_attachment_image_url(get_user_meta($user_id, 'profile_image', true), 'thumbnail'));
+        $profile = array(
+            'id' => $user->ID,
+            'username' => $user->user_login,
+            'email' => $user->user_email,
+            'fullName' => !empty(get_user_meta($user_id, 'full_name', true)) ? get_user_meta($user_id, 'full_name', true) : $user->display_name,
+            'firstName' => get_user_meta($user_id, 'first_name', true),
+            'lastName' => get_user_meta($user_id, 'last_name', true),
+            'mobileNumber' => get_user_meta($user_id, 'mobile_number', true),
+            'dob' => get_user_meta($user_id, 'dob', true) ? date('Y-m-d', strtotime(get_user_meta($user_id, 'dob', true))) : get_user_meta($user_id, 'dob', true),
+            'class' => get_user_meta($user_id, 'class', true),
+            'subject' => get_user_meta($user_id, 'subject', true),
+            'status' =>(boolean) get_user_meta($user_id, 'status', true),
+            'userRole' => $user->roles[0],
+            'profileImage' => $profileImageUrl ? esc_url($profileImageUrl) : site_url() . "/wp-content/uploads/2024/12/images.png"
+        );
+
+        return $profile;
+    }
+
+
+    // public function allTeachers($data)
+    // {
+    //     $this->isValidToken();
+    //     $param=$data->get_json_params();
+    //     $results_per_page = 5;
+    //     $page=$param['page'];
+    //     $offset = ($page - 1) * $results_per_page;
+    //     global $wpdb;
+
+    //     // $records = $wpdb->get_results(
+    //     //     $wpdb->prepare(
+    //     //     "SELECT 
+    //     //     user.ID, 
+    //     //     user.user_login, 
+    //     //     user.user_email,
+    //     //     -- m1.meta_value AS mobile_number,
+    //     //     -- m2.meta_value AS profile_image,
+    //     //     -- m3.meta_value AS full_name
+    //     //     FROM wp_users AS user
+    //     //     -- INNER JOIN wp_usermeta AS m1 
+    //     //     -- ON user.ID = m1.user_id AND m1.meta_key = 'mobile_number'
+    //     //     -- LEFT JOIN wp_usermeta AS m2 
+    //     //     -- ON user.ID = m2.user_id AND m2.meta_key = 'profile_image'
+    //     //     -- INNER JOIN wp_usermeta AS m3 
+    //     //     -- ON user.ID = m3.user_id AND m3.meta_key = 'full_name'
+    //     //     INNER JOIN wp_usermeta AS usermeta 
+    //     //     ON user.ID = usermeta.user_id
+    //     //     WHERE usermeta.meta_key = %s
+    //     //     AND usermeta.meta_value LIKE %s
+    //     //     LIMIT %d OFFSET %d",
+    //     //     $wpdb->prefix . 'capabilities',
+    //     //     '%"teacher"%',
+    //     //     $results_per_page,
+    //     //     $offset
+    //     //     )
+    //     // );
+   
+    //     $records=[];
+    //     $total_records = $wpdb->get_var(
+    //         $wpdb->prepare(
+    //             "SELECT COUNT(*)
+    //         FROM wp_users AS user
+    //         LEFT JOIN wp_usermeta AS usermeta 
+    //         ON user.ID = usermeta.user_id
+    //         WHERE usermeta.meta_key = 'wp_capabilities'
+    //         AND usermeta.meta_value LIKE %s",
+    //             '%"teacher"%',
+    //         )
+    //     );
+    //     $users = $wpdb->get_results(
+    //         $wpdb->prepare(
+    //         "SELECT *
+    //         FROM wp_users AS user
+    //         LEFT JOIN wp_usermeta AS usermeta 
+    //         ON user.ID = usermeta.user_id
+    //         WHERE usermeta.meta_key = 'wp_capabilities'
+    //         AND usermeta.meta_value LIKE %s
+    //         LIMIT %d OFFSET %d",
+    //             '%"teacher"%',
+    //             $results_per_page,
+    //             $offset
+    //         )
+    //     );
+        
+
+
+    //     foreach($users as $user)
+    //     {
+    //         $profileImage= wp_get_attachment_image_url(get_user_meta($user->ID, 'profile_image', true), 'thumbnail') ? wp_get_attachment_image_url(get_user_meta($user->ID, 'profile_image', true), 'large') : '';
+    //         $records[]=array(
+    //             'id'=>$user->ID,
+    //             'username'=> $user->user_login,
+    //             'email'=>$user->user_email,
+    //             'dob'=>get_user_meta($user->ID,'dob',true),
+    //             'mob'=>get_user_meta($user->ID,'mobile_number',true),
+    //             'profileImage'=> $profileImage,
+    //             'fullname'=> get_user_meta($user->ID, 'full_name', true),
+    //             'class' => get_user_meta($user->ID, 'class', true),
+    //             'subject' => get_user_meta($user->ID, 'subject', true),
+
+    //         );
+    //     }
+
+        
+        
+    //     $result['total_records'] = $total_records;
+    //     $result['records'] = $records;
+
+    //     return $this->successResponse('Success', $result);
+    // }
+
+    public function  getAllTeachers($data)
+    {
+        $param=$data->get_json_params();
+        $this->isValidToken();
+        $offset=($param['page']-1) * 4;
+        $args = array(
+            'role'    => 'Teacher',
+            'orderby' => 'display_name',
+            'order'   => 'ASC',
+        );
+        
+        $users=get_users($args);
+        $total_records=count($users);
+
+        $args = array(
+            'role'    => 'Teacher',
+            'orderby' => 'display_name',
+            'order'   => 'ASC',
+            'number'  => 4, 
+            'offset'  => $offset,   
+        );
+
+        $users = get_users($args);
+
+        $records=[];
+
+        foreach($users as $user)
+        {
+            
+            $fullName=get_user_meta($user->ID,'full_name',true);
+            $dob=get_user_meta($user->ID,'dob',true);
+            $mobileNumber=get_user_meta($user->ID,'mobile_number',true);
+            $class=get_user_meta($user->ID,'class',true);
+            $subject=get_user_meta($user->ID,'subject',true);
+            $status=(boolean)get_user_meta($user->ID,'status',true);
+            $profileImage=wp_get_attachment_image_url(get_user_meta($user->ID,'profile_image',true),'thumbnail')? wp_get_attachment_image_url(get_user_meta($user->ID, 'profile_image', true), 'large') : '';
+            $records[]=array(
+                'id' => $user->ID,
+                'fullname'=> $fullName,
+                'username'=>$user->user_login,
+                'email'=>$user->user_email,
+                'dob'=>$dob,
+                'roles'=>$user->roles[0],
+                'mob'=> $mobileNumber,
+                'profileImage'=>$profileImage,
+                'class'=>$class,
+                'subject'=> $subject,
+                'status'=> $status?$status:false,
+            );
+        }
+        $result['total_records']=$total_records;
+        $result['records']= $records;
+
+       return $this->successResponse('Success', $result);
+    }
+
+    public function subjectTeachers($data)
+    {
+        $param=$data->get_json_params();
+        $args=array(
+            'role'=>'Teacher'
+        );
+        $users=get_users($args);
+        $teachers=[];
+        foreach($users as $user)
+        {
+            if(get_user_meta($user->ID,'class',true)==$param['class'])
+            {
+                $teachers[]=array(
+                    'id'=>$user->ID,
+                    'fullName'=>get_user_meta($user->ID,'full_name',true)
+                );
+            }
+
+        }
+
+        if(empty($teachers))
+        {
+            return $this->errorResponse('Error No Teachers in','Error',200);
+        }
+        return $this->successResponse('Success', $teachers);
+    }
+
+    public function alotTimePeriod($data)
+    {
+        $this->isValidToken();
+        $param=$data->get_json_params();
+        global $wpdb;
+        $tableName=$wpdb->prefix.'timeperiod';
+        $data=array(
+            'class'=> $param['class'],
+            'subject'=> $param['subject'],
+            'teacherId'=> $param['teacherId'],
+            'date'=> $param['date'],
+            'start_time'=> $param['startTime'],
+            'end_time'=> $param['endTime'],
+
+        );
+        $inserted=$wpdb->insert($tableName,$data);
+        if($inserted)
+        {
+            return $this->successResponse('success',  $wpdb->insert_id);
+        }else
+        {
+            return $this->errorResponse('error');
+        }
+    
+    }
+
+    public function periodDetails($data)
+    {
+        $this->isValidToken();
+        $param=$data->get_json_params();
+        global $wpdb;
+        $tableName=$wpdb->prefix.'timeperiod';
+        $per_page_limit=3;
+        $offset=($param['currentPage']-1)*$per_page_limit;
+        $total_records=$wpdb->get_var("SELECT COUNT(*) FROM {$tableName}");
+        $records = $wpdb->get_results("SELECT * FROM {$tableName} ORDER BY `id` DESC  LIMIT {$per_page_limit}  OFFSET {$offset}", ARRAY_A );
+        if (empty($records)) {
+            return $this->errorResponse('Error','Error : No Records Found');
+        }
+        foreach($records as &$record)
+        {
+            $record['teacherName'] = get_user_meta($record['teacherId'], 'full_name', true);
+
+        }
+        $result['records']=$records;
+        $result['total_records']=$total_records;
+        return $this->successResponse('success', $result);
+    }
+    public function updateProfile($request)
+    {
+        $this->isValidToken();
+        $param = $request->get_params();
+        $username = $param['username'];
+        $mobileNumber = $param['mobileNumber'];
+        $email = $param['email'];
+        $firstName = $param['firstName'];
+        $lastName = $param['lastName'];
+        $fullName = $firstName . ' ' . $lastName;
+        $dob = $param['dob'] ? date('Y-m-d', strtotime($param['dob'])) : $param['dob'];
+        $user_id = !empty($this->user_id) ? $this->user_id : false;
+        if ($user_id) {
+            $upload_dir         =   wp_upload_dir();
+            if ($param['profileImage']) {
+
+                $base64_image = $param['profileImage'];
+                if (preg_match('/^data:image\/(\w+);base64,/', $base64_image, $matches)) {
+
+
+                    $imageType = 'image/' . $matches[1];
+                    $base64data = explode(',', $base64_image)[1];
+                    $decodedData = base64_decode($base64data);
+                    if ($decodedData === false) {
+                        return $this->errorResponse('invalid_base64', 'Base64 decoding failed.');
+                    }
+                    $filename           =   'profile_image';
+                    $file_type          =   strtolower($matches[1]);
+                    $hashed_filename    =   md5($filename . microtime()) . '.' . $file_type;
+                    $file_path = $upload_dir['path'] . '/' . $hashed_filename;
+                    if (file_put_contents($file_path, $decodedData) === false) {
+                        return $this->errorResponse('file_save_failed', 'Failed to save the file.');
+                    }
+                    $attachment         =   array(
+                        'post_mime_type' =>  $imageType,
+                        'post_title'     =>  basename($hashed_filename),
+                        'post_content'   => '',
+                        'post_status'    => 'inherit',
+                        'guid'           => $upload_dir['url'] . '/' . basename($hashed_filename)
+                    );
+                    $attach_id = wp_insert_attachment($attachment, $file_path);
+                    $attach_data = wp_generate_attachment_metadata($attach_id, $file_path);
+                    wp_update_attachment_metadata($attach_id, $attach_data);
+                    update_user_meta($user_id, 'profile_image', $attach_id);
+                } elseif (filter_var($param['profileImage'], FILTER_VALIDATE_URL)) {
+                } else {
+                    return $this->errorResponse('invalid_image', 'Invalid image format.');
+                }
+            }
+
+            $user_data = array(
+                'ID' => $user_id,
+                'first_name' => $firstName,
+                'last_name' => $lastName,
+            );
+
+
+            wp_update_user($user_data);
+
+            update_user_meta($user_id, 'full_name', $fullName);
+            update_user_meta($user_id, 'mobile_number', $mobileNumber);
+            update_user_meta($user_id, 'dob', $dob);
+        } else {
+            return $this->errorResponse('Invalid User');
+        }
+        $result = $this->getProfile($user_id);
+        return $this->successResponse('Profile Updated Successfully', $result);
+    }
+
+    public  function checkAlottedPeriod($data)
+    {
+        $this->isValidToken();
+        $param=$data->get_json_params();
+        $time=$param['start_time'];
+        $time=explode('T',$time);
+        $time=implode(' ',$time);
+        $class=$param['class'];
+        $date=$param['date'];
+        global $wpdb;
+        $tableName=$wpdb->prefix. 'timeperiod';
+        $result=$wpdb->get_results("SELECT * FROM `$tableName` WHERE `class`= '$class'  AND `date`= '$date' AND `start_time`='$time'");
+        if($result)
+        {
+            return $this->errorResponse('Error : Period Already Alloted at this time', $result,200);
+        }else{
+            return $this->successResponse('success',$result);
+        }
+
+    }
+
+    public function checkAlottedClasses($data)
+    {
+        $param=$data->get_params();
+        $teacher_id=$param['teacherId'];
+        $date=$param['date'];
+        if(is_wp_error($teacher_id))
+        {
+            return $this->errorResponse('Error','Error',200);
+        }
+        global $wpdb;
+        $tableName=$wpdb->prefix.'timeperiod';
+        $records=$wpdb->get_results("SELECT * FROM {$tableName} WHERE `teacherId`=$teacher_id AND DATE(date)='$date'");
+        $total_records=$wpdb->get_var("SELECT * FROM {$tableName} WHERE `teacherId`=$teacher_id AND DATE(date)='$date'");
+        $classes['total_records']= $total_records;
+        $classes['records']= $records;
+        return $this->successResponse('Success', $classes);
+    }
+
+
+   public function updateLoginStatus($data)
+    {
+
+        global $wpdb;
+        $tableName=$wpdb->prefix.'teacher_attendance';
+    
+        $this->isValidToken();
+        $user_id = $this->user_id;
+        if (!$user_id) {
+            return $this->errorResponse('Error User Data not Found','Error',200);
+        }
+
+        $status=$data->get_param('status');
+        if($status)
+        {
+            update_user_meta($user_id, 'status', $status);
+            date_default_timezone_set('Asia/Calcutta');
+            $date = date("Y-m-d");
+            $query = $wpdb->get_results($wpdb->prepare("SELECT * FROM {$tableName} WHERE `teacherId`=$user_id AND DATE(date)=' $date'"));
+            if(!$query)
+            {
+                $loginTime = date('Y-m-d H:i:s', time());
+                    $insertData = [
+                        'teacherId' => $user_id,
+                        'login' => $loginTime,
+                        'date' => $date,
+                    ];
+
+                    $wpdb->insert($tableName, $insertData);
+            }
+            $timestamp = wp_next_scheduled('reset_login_status_after_timeout', [$user_id]);
+            if ($timestamp) {
+                wp_unschedule_event($timestamp, 'reset_login_status_after_timeout', [$user_id]);
+            }
+            wp_schedule_single_event(time() + HOUR_IN_SECONDS * 8, 'reset_login_status_after_timeout', [$user_id]);
+            $loginStatus = "Active";
+        }
+        else
+        {
+            $timestamp = wp_next_scheduled('reset_login_status_after_timeout', [$user_id]);
+            if ($timestamp) {
+                wp_unschedule_event($timestamp, 'reset_login_status_after_timeout', [$user_id]);
+            }
+            wp_schedule_single_event(time(), 'reset_login_status_after_timeout', [$user_id]);
+            $loginStatus='Inactive';
+
+                date_default_timezone_set('Asia/Calcutta');
+                $date = date("Y-m-d");
+                $logoutTime = date('Y-m-d H:i:s', time());
+                $logoutData=[
+                    'logout'=>$logoutTime
+                ];
+                $where=[
+                    'date'=> $date
+                ];
+
+               $wpdb->update($tableName, $logoutData,$where);
+        }
+
+        $arr['status']= $status;
+        $arr['loginStatus']=$loginStatus;
+        $arr['loginTime']=$loginTime;
+        return  $this->successResponse('Login Status Updated Successfully : '. $loginStatus,$arr);
+    }
+
+
+    public function  getTeachersAttedance($data)
+    {
+        $param = $data->get_json_params();
+        $this->isValidToken();
+        $date=$param['date'];
+        global $wpdb;
+        $tableName=$wpdb->prefix. 'teacher_attendance';
+        $offset = ($param['page'] - 1) * 4;
+        $teachers=$wpdb->get_results("SELECT * FROM $tableName WHERE DATE(date)='$date'");
+
+       
+        $users= get_users(
+            array(
+                'role'=>'Teacher',
+                'number'=>4,
+                'offset'=>$offset
+            )
+            );
+
+        $total_records=count(get_users(array('role'=>'Teacher')));
+        foreach ($users as $user) {
+            $fullName = get_user_meta($user->ID, 'full_name', true);
+            $dob = get_user_meta($user->ID, 'dob', true)?date('m/d/Y',strtotime(get_user_meta($user->ID, 'dob', true))): get_user_meta($user->ID, 'dob', true);
+            $mobileNumber = get_user_meta($user->ID, 'mobile_number', true);
+            $class = get_user_meta($user->ID, 'class', true);
+            $subject = get_user_meta($user->ID, 'subject', true);
+            $status = (bool)get_user_meta($user->ID, 'status', true);
+            $profileImage = wp_get_attachment_image_url(get_user_meta($user->ID, 'profile_image', true), 'thumbnail') ? wp_get_attachment_image_url(get_user_meta($user->ID, 'profile_image', true), 'large') : '';
+            $login=false;
+            $logout=false;
+            foreach ($teachers as $teacher) {
+                if ($teacher->teacherId == $user->ID) {
+                    date_default_timezone_set('Asia/Calcutta');
+                    $login=date('H:i A', strtotime($teacher->login)) ;
+                    if($teacher->logout=='0000-00-00 00:00:00')
+                    {
+                        $logout = 'ACTIVE';
+
+                    }else
+                    {
+                        $logout = date('h:i A', strtotime($teacher->logout));
+                    }
+
+                }
+            }
+            $records[] = array(
+                'id' => $user->ID,
+                'fullname' => $fullName,
+                'email' => $user->user_email,
+                'dob' => $dob,
+                'roles' => $user->roles[0],
+                'mob' => $mobileNumber,
+                'profileImage' => $profileImage,
+                'class' => $class,
+                'subject' => $subject,
+                'status' => $status ? $status : false,
+                'loginTime' => $login,
+                'logoutTime' => $logout,
+
+            );
+
+        
+        }
+
+        $result['total_records'] = $total_records;
+        $result['records'] = $records;
+
+        return $this->successResponse('Success', $result);
+    }
+
+    public function loginS()
+    {
+        global $wpdb;
+        $tableName = $wpdb->prefix . 'teacher_attendance';
+        $this->isValidToken();
+        $user_id = $this->user_id;
+        if (!$user_id) {
+            return $this->errorResponse('Error User Data not Found', 'Error', 200);
+        }
+        $date = date("Y-m-d");
+        $query = $wpdb->get_results($wpdb->prepare("SELECT * FROM {$tableName} WHERE `teacherId`=$user_id AND DATE(date)=' $date'"));
+        if (!$query) {
+            echo "Got Login Data";
+        }else{
+            echo "No Login Data";
+        }
+    }
+
+
+
+}
+
+$serverApi = new CRC_REST_API();
+$serverApi->init();
 add_filter('jwt_auth_token_before_dispatch', array($serverApi, 'jwt_auth'), 10, 2);
